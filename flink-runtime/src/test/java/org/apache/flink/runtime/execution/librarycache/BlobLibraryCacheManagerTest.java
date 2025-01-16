@@ -58,6 +58,7 @@ import static org.hamcrest.Matchers.sameInstance;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
@@ -74,6 +75,69 @@ public class BlobLibraryCacheManagerTest extends TestLogger {
     }
 
     @Parameterized.Parameter public boolean wrapsSystemClassLoader;
+
+    @Test
+    public void testLibraryCacheBlobIssue() throws Exception {
+
+        JobID jobID = new JobID();
+
+        BlobServer server = null;
+        PermanentBlobCache cache = null;
+        BlobLibraryCacheManager libCache = null;
+
+        final byte[] jarContents = new byte[128];
+
+        try {
+            Configuration config = new Configuration();
+            // Default cache clean up interval (library-cache-manager.cleanup.interval) is 1 hour.
+            // Considering if reducing this considerable (like to 1 sec) would help.
+            config.set(BlobServerOptions.CLEANUP_INTERVAL, 1L);
+
+            server = new BlobServer(config, temporaryFolder.newFolder(), new VoidBlobStore());
+            server.start();
+
+            InetSocketAddress serverAddress = new InetSocketAddress("localhost", server.getPort());
+            cache = new PermanentBlobCache(config, temporaryFolder.newFolder(), new VoidBlobStore(), serverAddress);
+
+            // Initial Job submission
+            List<PermanentBlobKey> jarKeys = new ArrayList<>(1);
+            jarKeys.add(server.putPermanent(jobID, jarContents));
+
+            libCache = createBlobLibraryCacheManager(cache);
+            cache.registerJob(jobID);
+
+            final LibraryCacheManager.ClassLoaderLease classLoaderLease = libCache.registerClassLoaderLease(jobID);
+            final UserCodeClassLoader classLoader = classLoaderLease.getOrResolveClassLoader(jarKeys, Collections.emptyList());
+            // Task uses classLoader to load the job's code
+
+            /* Lease is NOT released, either because:
+                - Tasks fail to call release() on the lease OR
+                - The reference count on the lease is imbalanced (more calls to "obtain" than to "release" the lease)
+            */
+            // classLoaderLease.release();
+
+            // Resubmission (same Job id and jar(s))
+            List<PermanentBlobKey> newJarKeys = new ArrayList<>();
+            newJarKeys.add(server.putPermanent(jobID, jarContents));
+
+            // Task requests class loader, fails because the cache contains an entry for the same job id but with different jar keys
+            final LibraryCacheManager finalLibCache = libCache;
+            assertThrows(IllegalStateException.class, () -> {
+                finalLibCache
+                        .registerClassLoaderLease(jobID)
+                        .getOrResolveClassLoader(newJarKeys, Collections.emptyList());
+            });
+
+        } finally {
+            if (libCache != null) {
+                libCache.shutdown();
+            }
+
+            if (server != null) {
+                server.close();
+            }
+        }
+    }
 
     /**
      * Tests that the {@link BlobLibraryCacheManager} cleans up after the class loader leases for
