@@ -80,54 +80,57 @@ public class BlobLibraryCacheManagerTest extends TestLogger {
     public void testLibraryCacheBlobIssue() throws Exception {
 
         JobID jobID = new JobID();
+
         BlobServer server = null;
         PermanentBlobCache cache = null;
         BlobLibraryCacheManager libCache = null;
 
-        final byte[] jar = new byte[128];
+        final byte[] jarContents = new byte[128];
 
         try {
             Configuration config = new Configuration();
+            // Default cache clean up interval (library-cache-manager.cleanup.interval) is 1 hour.
+            // Considering if reducing this considerable (like to 1 sec) would help.
             config.set(BlobServerOptions.CLEANUP_INTERVAL, 1L);
 
             server = new BlobServer(config, temporaryFolder.newFolder(), new VoidBlobStore());
             server.start();
+
             InetSocketAddress serverAddress = new InetSocketAddress("localhost", server.getPort());
             cache = new PermanentBlobCache(config, temporaryFolder.newFolder(), new VoidBlobStore(), serverAddress);
 
             // Initial Job submission
-            List<PermanentBlobKey> keys = new ArrayList<>();
-            keys.add(server.putPermanent(jobID, jar));
+            List<PermanentBlobKey> jarKeys = new ArrayList<>(1);
+            jarKeys.add(server.putPermanent(jobID, jarContents));
 
             libCache = createBlobLibraryCacheManager(cache);
             cache.registerJob(jobID);
 
             final LibraryCacheManager.ClassLoaderLease classLoaderLease = libCache.registerClassLoaderLease(jobID);
-            final UserCodeClassLoader classLoader = classLoaderLease.getOrResolveClassLoader(keys, Collections.emptyList());
+            final UserCodeClassLoader classLoader = classLoaderLease.getOrResolveClassLoader(jarKeys, Collections.emptyList());
+            // Task uses classLoader to load the job's code
 
-            // Lease is NOT released
+            /* Lease is NOT released, either because:
+                - Tasks fail to call release() on the lease OR
+                - The reference count on the lease is imbalanced (more calls to "obtain" than to "release" the lease)
+            */
             // classLoaderLease.release();
 
             // Resubmission (same Job id and jar(s))
-            List<PermanentBlobKey> keys2 = new ArrayList<>();
-            keys2.add(server.putPermanent(jobID, jar));
+            List<PermanentBlobKey> newJarKeys = new ArrayList<>();
+            newJarKeys.add(server.putPermanent(jobID, jarContents));
 
             // Task requests class loader, fails because the cache contains an entry for the same job id but with different jar keys
             final LibraryCacheManager finalLibCache = libCache;
             assertThrows(IllegalStateException.class, () -> {
                 finalLibCache
                         .registerClassLoaderLease(jobID)
-                        .getOrResolveClassLoader(keys2, Collections.emptyList());
+                        .getOrResolveClassLoader(newJarKeys, Collections.emptyList());
             });
 
         } finally {
             if (libCache != null) {
                 libCache.shutdown();
-            }
-
-            // should have been closed by the libraryCacheManager, but just in case
-            if (cache != null) {
-                cache.close();
             }
 
             if (server != null) {
