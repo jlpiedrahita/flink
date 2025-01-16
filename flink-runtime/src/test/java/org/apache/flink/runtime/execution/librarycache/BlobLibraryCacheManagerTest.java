@@ -58,6 +58,7 @@ import static org.hamcrest.Matchers.sameInstance;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
@@ -74,6 +75,66 @@ public class BlobLibraryCacheManagerTest extends TestLogger {
     }
 
     @Parameterized.Parameter public boolean wrapsSystemClassLoader;
+
+    @Test
+    public void testLibraryCacheBlobIssue() throws Exception {
+
+        JobID jobID = new JobID();
+        BlobServer server = null;
+        PermanentBlobCache cache = null;
+        BlobLibraryCacheManager libCache = null;
+
+        final byte[] jar = new byte[128];
+
+        try {
+            Configuration config = new Configuration();
+            config.set(BlobServerOptions.CLEANUP_INTERVAL, 1L);
+
+            server = new BlobServer(config, temporaryFolder.newFolder(), new VoidBlobStore());
+            server.start();
+            InetSocketAddress serverAddress = new InetSocketAddress("localhost", server.getPort());
+            cache = new PermanentBlobCache(config, temporaryFolder.newFolder(), new VoidBlobStore(), serverAddress);
+
+            // Initial Job submission
+            List<PermanentBlobKey> keys = new ArrayList<>();
+            keys.add(server.putPermanent(jobID, jar));
+
+            libCache = createBlobLibraryCacheManager(cache);
+            cache.registerJob(jobID);
+
+            final LibraryCacheManager.ClassLoaderLease classLoaderLease = libCache.registerClassLoaderLease(jobID);
+            final UserCodeClassLoader classLoader = classLoaderLease.getOrResolveClassLoader(keys, Collections.emptyList());
+
+            // Lease is NOT released
+            // classLoaderLease.release();
+
+            // Resubmission (same Job id and jar(s))
+            List<PermanentBlobKey> keys2 = new ArrayList<>();
+            keys2.add(server.putPermanent(jobID, jar));
+
+            // Task requests class loader, fails because the cache contains an entry for the same job id but with different jar keys
+            final LibraryCacheManager finalLibCache = libCache;
+            assertThrows(IllegalStateException.class, () -> {
+                finalLibCache
+                        .registerClassLoaderLease(jobID)
+                        .getOrResolveClassLoader(keys2, Collections.emptyList());
+            });
+
+        } finally {
+            if (libCache != null) {
+                libCache.shutdown();
+            }
+
+            // should have been closed by the libraryCacheManager, but just in case
+            if (cache != null) {
+                cache.close();
+            }
+
+            if (server != null) {
+                server.close();
+            }
+        }
+    }
 
     /**
      * Tests that the {@link BlobLibraryCacheManager} cleans up after the class loader leases for
